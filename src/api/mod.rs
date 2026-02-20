@@ -61,23 +61,11 @@ struct InviteRecord {
     tenant_id: Uuid,
     email: String,
     token_hash: String,
-    raw_token: String,
     used: bool,
     expires_at: chrono::DateTime<Utc>,
 }
 
-fn hash_password(password: &str) -> Result<String, StatusCode> {
-    if password.trim().is_empty() {
-        return Err(StatusCode::BAD_REQUEST);
-    }
-    Ok(format!("sha256${}", security::hash_token_sha256(password)))
-}
-
-fn verify_password(password_hash: &str, password: &str) -> bool {
-    password_hash == format!("sha256${}", security::hash_token_sha256(password))
-}
-
-#[derive(Clone, Serialize)]
+#[derive(Clone, Debug, Serialize)]
 struct TenantMember {
     tenant_id: Uuid,
     user_id: Uuid,
@@ -122,29 +110,29 @@ pub fn router(state: AppState) -> Router {
         .route("/auth/restore", post(restore_password))
         .route("/auth/reset-confirm", post(reset_confirm))
         .route("/auth/sessions", get(list_sessions))
-        .route("/auth/sessions/{family_id}", delete(delete_session))
-        .route("/auth/sessions/{family_id}/trust", patch(trust_session))
+        .route("/auth/sessions/:family_id", delete(delete_session))
+        .route("/auth/sessions/:family_id/trust", patch(trust_session))
         .route("/auth/sessions/push-token", post(register_push_token))
         .route("/auth/sessions/push-token", delete(delete_push_token))
         .route("/auth/invites", post(create_invite_legacy))
         .route("/auth/invites/accept", post(accept_invite_legacy))
-        .route("/api/tenants/{tenant_id}/invites", post(create_invite))
-        .route("/api/tenants/{tenant_id}/invites", get(list_invites))
+        .route("/api/tenants/:tenant_id/invites", post(create_invite))
+        .route("/api/tenants/:tenant_id/invites", get(list_invites))
         .route(
-            "/api/tenants/{tenant_id}/invites/{invite_id}",
+            "/api/tenants/:tenant_id/invites/:invite_id",
             delete(delete_invite),
         )
         .route("/api/invites/accept", post(accept_invite))
-        .route("/api/tenants/{tenant_id}/members", get(list_members))
+        .route("/api/tenants/:tenant_id/members", get(list_members))
         .route(
-            "/api/tenants/{tenant_id}/members/{user_id}",
+            "/api/tenants/:tenant_id/members/:user_id",
             delete(remove_member),
         )
         .route(
-            "/api/tenants/{tenant_id}/members/{user_id}/status",
+            "/api/tenants/:tenant_id/members/:user_id/status",
             patch(update_member_status),
         )
-        .route("/internal/users/{user_id}/tenants", get(user_tenants))
+        .route("/internal/users/:user_id/tenants", get(user_tenants))
         .route("/internal/verify-token", post(verify_token))
         .route("/internal/users/lookup", post(lookup_user))
         .with_state(state)
@@ -228,7 +216,7 @@ struct LoginResponse {
     access_token: String,
     refresh_token: String,
     expires_in: i64,
-    token_type: &'static str,
+    token_type: String,
     family_id: Uuid,
 }
 
@@ -291,7 +279,7 @@ async fn login(
         access_token: tokens.access_token,
         refresh_token: tokens.refresh_token,
         expires_in: tokens.expires_in,
-        token_type: "Bearer",
+        token_type: "Bearer".to_string(),
         family_id: tokens.family_id,
     };
 
@@ -584,7 +572,7 @@ struct CreateInviteRequest {
     email: String,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 struct CreateInviteResponse {
     user_id: Uuid,
     is_new: bool,
@@ -609,15 +597,6 @@ async fn create_invite(
         return Err(StatusCode::BAD_REQUEST);
     }
 
-    let existing_user_id = state
-        .users
-        .read()
-        .await
-        .get(payload.email.trim())
-        .map(|u| u.user_id);
-    let user_id = existing_user_id.unwrap_or_else(Uuid::new_v4);
-    let is_new = existing_user_id.is_none();
-
     let invite_id = Uuid::new_v4();
     let token = format!("invite-{}", Uuid::new_v4());
     let expires_at = Utc::now() + Duration::hours(24);
@@ -633,7 +612,6 @@ async fn create_invite(
         tenant_id,
         email: payload.email.trim().to_string(),
         token_hash: security::hash_token_sha256(&token),
-        raw_token: token.clone(),
         used: false,
         expires_at,
     };
@@ -764,7 +742,6 @@ async fn create_invite_legacy(
             tenant_id: payload.tenant_id,
             email,
             token_hash: security::hash_token_sha256(&token),
-            raw_token: token.clone(),
             used: false,
             expires_at,
         },
