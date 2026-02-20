@@ -4,6 +4,8 @@ pub struct AppConfig {
     pub port: u16,
     pub issuer: String,
     pub service_name: String,
+    pub database_url: Option<String>,
+    pub redis_url: Option<String>,
 }
 
 impl AppConfig {
@@ -17,6 +19,8 @@ impl AppConfig {
             issuer: std::env::var("AUTH_ISSUER")
                 .unwrap_or_else(|_| "https://auth.example.com".to_string()),
             service_name: "auth".to_string(),
+            database_url: std::env::var("DATABASE_URL").ok(),
+            redis_url: std::env::var("REDIS_URL").ok(),
         }
     }
 }

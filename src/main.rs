@@ -1,12 +1,7 @@
-mod api;
-mod config;
-mod domain;
-mod security;
-
 use std::net::SocketAddr;
 
 use anyhow::Context;
-use api::AppState;
+use rust_auth_service::{api, config};
 use tokio::net::TcpListener;
 use tracing::info;
 
@@ -15,9 +10,14 @@ async fn main() -> anyhow::Result<()> {
     init_tracing();
     let config = config::AppConfig::from_env();
 
-    let app = api::router(AppState {
-        config: config.clone(),
-    });
+    if let Some(db) = &config.database_url {
+        info!(database_url = %db, "postgres configured");
+    }
+    if let Some(redis) = &config.redis_url {
+        info!(redis_url = %redis, "redis configured");
+    }
+
+    let app = api::router(api::AppState::new(config.clone()));
 
     let addr: SocketAddr = format!("{}:{}", config.host, config.port)
         .parse()

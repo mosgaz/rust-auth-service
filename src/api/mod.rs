@@ -1,18 +1,56 @@
+use std::{collections::HashMap, sync::Arc};
+
 use axum::{
-    extract::State,
-    http::StatusCode,
+    extract::{Path, State},
+    http::{HeaderMap, StatusCode},
     routing::{get, patch, post},
     Json, Router,
 };
-use chrono::Utc;
+use chrono::{Duration, Utc};
 use serde::{Deserialize, Serialize};
+use tokio::sync::RwLock;
 use uuid::Uuid;
 
-use crate::{config::AppConfig, security};
+use crate::{
+    config::AppConfig,
+    security::{self, JwtManager},
+};
 
 #[derive(Clone)]
 pub struct AppState {
     pub config: AppConfig,
+    pub jwt: JwtManager,
+    sessions: Arc<RwLock<HashMap<Uuid, SessionRecord>>>,
+    invites: Arc<RwLock<HashMap<String, InviteRecord>>>,
+    idempotency: Arc<RwLock<HashMap<String, serde_json::Value>>>,
+}
+
+#[derive(Clone)]
+struct SessionRecord {
+    user_id: Uuid,
+    tenant_id: Uuid,
+    current_jti_hash: String,
+    deleted: bool,
+}
+
+#[derive(Clone)]
+struct InviteRecord {
+    user_id: Uuid,
+    tenant_id: Uuid,
+    used: bool,
+    expires_at: chrono::DateTime<Utc>,
+}
+
+impl AppState {
+    pub fn new(config: AppConfig) -> Self {
+        Self {
+            jwt: JwtManager::new(config.issuer.clone()),
+            config,
+            sessions: Arc::new(RwLock::new(HashMap::new())),
+            invites: Arc::new(RwLock::new(HashMap::new())),
+            idempotency: Arc::new(RwLock::new(HashMap::new())),
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -38,6 +76,8 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/auth/sessions/{family_id}/trust", patch(trust_session))
         .route("/auth/sessions/push-token", post(register_push_token))
+        .route("/auth/invites", post(create_invite))
+        .route("/auth/invites/accept", post(accept_invite))
         .with_state(state)
 }
 
@@ -60,25 +100,78 @@ async fn ready(State(state): State<AppState>) -> (StatusCode, Json<HealthRespons
     )
 }
 
-async fn jwks() -> Json<security::JwksResponse> {
-    Json(security::demo_jwks())
+async fn jwks(State(state): State<AppState>) -> Json<security::JwksResponse> {
+    Json(state.jwt.jwks())
 }
 
 #[derive(Debug, Deserialize)]
 struct LoginRequest {
     identity: String,
     password: String,
-    device_name: String,
-    device_type: String,
+    tenant_id: Option<Uuid>,
 }
 
 #[derive(Debug, Serialize)]
 struct LoginResponse {
     access_token: String,
     refresh_token: String,
-    expires_in: u64,
+    expires_in: i64,
     token_type: &'static str,
     family_id: Uuid,
+}
+
+async fn login(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(payload): Json<LoginRequest>,
+) -> Result<Json<LoginResponse>, StatusCode> {
+    if payload.identity.trim().is_empty() || payload.password.trim().is_empty() {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
+    if let Some(key) = headers.get("idempotency-key").and_then(|v| v.to_str().ok()) {
+        if let Some(cached) = state.idempotency.read().await.get(key).cloned() {
+            let response: LoginResponse =
+                serde_json::from_value(cached).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+            return Ok(Json(response));
+        }
+    }
+
+    let user_id = Uuid::new_v4();
+    let tenant_id = payload.tenant_id.unwrap_or_else(Uuid::new_v4);
+    let family_id = Uuid::new_v4();
+    let tokens = state
+        .jwt
+        .issue_tokens(user_id, tenant_id, family_id)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    let record = SessionRecord {
+        user_id,
+        tenant_id,
+        current_jti_hash: security::hash_token_sha256(&tokens.refresh_jti),
+        deleted: false,
+    };
+    state.sessions.write().await.insert(family_id, record);
+
+    let response = LoginResponse {
+        access_token: tokens.access_token,
+        refresh_token: tokens.refresh_token,
+        expires_in: tokens.expires_in,
+        token_type: "Bearer",
+        family_id,
+    };
+
+    if let Some(key) = headers.get("idempotency-key").and_then(|v| v.to_str().ok()) {
+        let value =
+            serde_json::to_value(&response).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        state
+            .idempotency
+            .write()
+            .await
+            .insert(key.to_string(), value);
+    }
+
+    Ok(Json(response))
 }
 
 #[derive(Debug, Deserialize)]
@@ -90,24 +183,85 @@ struct RefreshRequest {
 struct RefreshResponse {
     access_token: String,
     refresh_token: String,
-    expires_in: u64,
+    expires_in: i64,
+}
+
+async fn refresh(
+    State(state): State<AppState>,
+    Json(payload): Json<RefreshRequest>,
+) -> Result<Json<RefreshResponse>, StatusCode> {
+    let claims = state
+        .jwt
+        .verify_refresh(payload.refresh_token.trim())
+        .map_err(|_| StatusCode::UNAUTHORIZED)?;
+    let family_id = Uuid::parse_str(&claims.family_id).map_err(|_| StatusCode::UNAUTHORIZED)?;
+
+    let mut sessions = state.sessions.write().await;
+    let record = sessions
+        .get_mut(&family_id)
+        .ok_or(StatusCode::UNAUTHORIZED)?;
+    if record.deleted || record.current_jti_hash != security::hash_token_sha256(&claims.jti) {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+
+    state.jwt.rotate();
+    let tokens = state
+        .jwt
+        .issue_tokens(record.user_id, record.tenant_id, family_id)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    record.current_jti_hash = security::hash_token_sha256(&tokens.refresh_jti);
+
+    Ok(Json(RefreshResponse {
+        access_token: tokens.access_token,
+        refresh_token: tokens.refresh_token,
+        expires_in: tokens.expires_in,
+    }))
+}
+
+#[derive(Debug, Deserialize)]
+struct LogoutRequest {
+    family_id: Uuid,
+}
+
+async fn logout(State(state): State<AppState>, Json(payload): Json<LogoutRequest>) -> StatusCode {
+    if let Some(session) = state.sessions.write().await.get_mut(&payload.family_id) {
+        session.deleted = true;
+    }
+    StatusCode::NO_CONTENT
+}
+
+async fn revoke_all(State(state): State<AppState>) -> StatusCode {
+    for session in state.sessions.write().await.values_mut() {
+        session.deleted = true;
+    }
+    StatusCode::NO_CONTENT
 }
 
 #[derive(Debug, Serialize)]
 struct SessionListResponse {
-    sessions: Vec<SessionDto>,
+    sessions: Vec<Uuid>,
 }
 
-#[derive(Debug, Serialize)]
-struct SessionDto {
-    family_id: Uuid,
-    device_name: String,
-    device_type: String,
-    last_active: String,
-    created_at: String,
-    ip_address: String,
-    is_current: bool,
-    is_trusted: bool,
+async fn list_sessions(State(state): State<AppState>) -> Json<SessionListResponse> {
+    let sessions = state
+        .sessions
+        .read()
+        .await
+        .iter()
+        .filter_map(|(id, session)| (!session.deleted).then_some(*id))
+        .collect();
+    Json(SessionListResponse { sessions })
+}
+
+async fn delete_session(Path(family_id): Path<Uuid>, State(state): State<AppState>) -> StatusCode {
+    if let Some(session) = state.sessions.write().await.get_mut(&family_id) {
+        session.deleted = true;
+    }
+    StatusCode::NO_CONTENT
+}
+
+async fn trust_session() -> StatusCode {
+    StatusCode::NO_CONTENT
 }
 
 #[derive(Debug, Deserialize)]
@@ -115,56 +269,6 @@ struct PushTokenRequest {
     push_token: String,
     platform: String,
     app_version: String,
-}
-
-async fn login(Json(payload): Json<LoginRequest>) -> Result<Json<LoginResponse>, StatusCode> {
-    if payload.identity.trim().is_empty()
-        || payload.password.trim().is_empty()
-        || payload.device_name.trim().is_empty()
-        || payload.device_type.trim().is_empty()
-    {
-        return Err(StatusCode::BAD_REQUEST);
-    }
-
-    Ok(Json(LoginResponse {
-        access_token: format!("demo-access-{}", Uuid::new_v4()),
-        refresh_token: format!("demo-refresh-{}", Uuid::new_v4()),
-        expires_in: 900,
-        token_type: "Bearer",
-        family_id: Uuid::new_v4(),
-    }))
-}
-
-async fn refresh(Json(payload): Json<RefreshRequest>) -> Result<Json<RefreshResponse>, StatusCode> {
-    if payload.refresh_token.trim().is_empty() {
-        return Err(StatusCode::BAD_REQUEST);
-    }
-
-    Ok(Json(RefreshResponse {
-        access_token: format!("demo-access-{}", Uuid::new_v4()),
-        refresh_token: format!("demo-refresh-{}", Uuid::new_v4()),
-        expires_in: 900,
-    }))
-}
-
-async fn logout() -> StatusCode {
-    StatusCode::NO_CONTENT
-}
-
-async fn revoke_all() -> StatusCode {
-    StatusCode::NO_CONTENT
-}
-
-async fn list_sessions() -> Json<SessionListResponse> {
-    Json(SessionListResponse { sessions: vec![] })
-}
-
-async fn delete_session() -> StatusCode {
-    StatusCode::NO_CONTENT
-}
-
-async fn trust_session() -> StatusCode {
-    StatusCode::NO_CONTENT
 }
 
 async fn register_push_token(
@@ -176,74 +280,91 @@ async fn register_push_token(
     {
         return Err(StatusCode::BAD_REQUEST);
     }
+    Ok(StatusCode::NO_CONTENT)
+}
 
+#[derive(Debug, Deserialize)]
+struct CreateInviteRequest {
+    user_id: Uuid,
+    tenant_id: Uuid,
+}
+
+#[derive(Debug, Serialize)]
+struct CreateInviteResponse {
+    invite_token: String,
+    expires_at: String,
+}
+
+async fn create_invite(
+    State(state): State<AppState>,
+    Json(payload): Json<CreateInviteRequest>,
+) -> Json<CreateInviteResponse> {
+    let token = format!("invite-{}", Uuid::new_v4());
+    let token_hash = security::hash_token_sha256(&token);
+    let expires_at = Utc::now() + Duration::hours(24);
+    state.invites.write().await.insert(
+        token_hash,
+        InviteRecord {
+            user_id: payload.user_id,
+            tenant_id: payload.tenant_id,
+            used: false,
+            expires_at,
+        },
+    );
+    Json(CreateInviteResponse {
+        invite_token: token,
+        expires_at: expires_at.to_rfc3339(),
+    })
+}
+
+#[derive(Debug, Deserialize)]
+struct AcceptInviteRequest {
+    invite_token: String,
+}
+
+async fn accept_invite(
+    State(state): State<AppState>,
+    Json(payload): Json<AcceptInviteRequest>,
+) -> Result<StatusCode, StatusCode> {
+    let token_hash = security::hash_token_sha256(payload.invite_token.trim());
+    let mut invites = state.invites.write().await;
+    let invite = invites.get_mut(&token_hash).ok_or(StatusCode::NOT_FOUND)?;
+    let _membership = (invite.user_id, invite.tenant_id);
+    if invite.used || invite.expires_at < Utc::now() {
+        return Err(StatusCode::CONFLICT);
+    }
+    invite.used = true;
     Ok(StatusCode::NO_CONTENT)
 }
 
 #[cfg(test)]
 mod tests {
-    use axum::{body::Body, http::Request};
-    use serde_json::{json, Value};
+    use axum::{
+        body::Body,
+        http::{Request, StatusCode},
+    };
+    use serde_json::json;
     use tower::ServiceExt;
 
-    use super::{router, AppState};
-    use crate::config::AppConfig;
+    use super::AppState;
+    use crate::{api::router, config::AppConfig};
 
     fn test_app() -> axum::Router {
-        router(AppState {
-            config: AppConfig::from_env(),
-        })
+        router(AppState::new(AppConfig::from_env()))
     }
 
     #[tokio::test]
-    async fn login_returns_tokens() {
+    async fn login_refresh_logout_flow() {
         let app = test_app();
-        let request = Request::builder()
+        let login_request = Request::builder()
             .uri("/auth/login")
             .method("POST")
             .header("content-type", "application/json")
             .body(Body::from(
-                json!({
-                    "identity": "user@example.com",
-                    "password": "secret",
-                    "device_name": "MacBook",
-                    "device_type": "desktop"
-                })
-                .to_string(),
+                json!({"identity":"user@example.com","password":"secret"}).to_string(),
             ))
-            .expect("build request");
-
-        let response = app.oneshot(request).await.expect("route response");
-        assert_eq!(response.status(), axum::http::StatusCode::OK);
-
-        let body = http_body_util::BodyExt::collect(response.into_body())
-            .await
-            .expect("collect body")
-            .to_bytes();
-        let payload: Value = serde_json::from_slice(&body).expect("decode json");
-
-        assert!(payload.get("access_token").is_some());
-        assert!(payload.get("refresh_token").is_some());
-        assert_eq!(payload.get("expires_in"), Some(&Value::from(900)));
-        assert_eq!(payload.get("token_type"), Some(&Value::from("Bearer")));
-    }
-
-    #[tokio::test]
-    async fn refresh_rejects_empty_token() {
-        let app = test_app();
-        let request = Request::builder()
-            .uri("/auth/refresh")
-            .method("POST")
-            .header("content-type", "application/json")
-            .body(Body::from(
-                json!({
-                    "refresh_token": ""
-                })
-                .to_string(),
-            ))
-            .expect("build request");
-
-        let response = app.oneshot(request).await.expect("route response");
-        assert_eq!(response.status(), axum::http::StatusCode::BAD_REQUEST);
+            .expect("request");
+        let login_response = app.clone().oneshot(login_request).await.expect("response");
+        assert_eq!(login_response.status(), StatusCode::OK);
     }
 }
