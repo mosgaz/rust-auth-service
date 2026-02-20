@@ -1,5 +1,7 @@
 # rust-auth-service
 
+[Техническое задание](docs/SPECIFICATION.md)
+
 Базовый каркас сервиса аутентификации (v4.0) на `Axum` с упором на:
 
 - чистую модульную структуру (`domain`, `api`, `security`, `config`);
