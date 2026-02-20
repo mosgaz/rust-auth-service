@@ -201,3 +201,209 @@ async fn full_new_endpoints_flow() {
     let logout_all_res = app.clone().oneshot(logout_all_req).await.unwrap();
     assert_eq!(logout_all_res.status(), StatusCode::NO_CONTENT);
 }
+
+#[tokio::test]
+async fn covers_remaining_routes() {
+    let app = router(AppState::new(AppConfig::from_env()));
+
+    let live_res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/health/live")
+                .method("GET")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(live_res.status(), StatusCode::OK);
+
+    let ready_res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/health/ready")
+                .method("GET")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(ready_res.status(), StatusCode::OK);
+
+    let jwks_res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/.well-known/jwks.json")
+                .method("GET")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(jwks_res.status(), StatusCode::OK);
+
+    let register_res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/auth/register")
+                .method("POST")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({"email":"coverage@example.com","password":"secret"}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(register_res.status(), StatusCode::CREATED);
+
+    let tenant_id = Uuid::new_v4();
+    let login_res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/auth/login")
+                .method("POST")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({"identity":"coverage@example.com","password":"secret", "tenant_id": tenant_id})
+                        .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(login_res.status(), StatusCode::OK);
+    let login_body = http_body_util::BodyExt::collect(login_res.into_body())
+        .await
+        .unwrap()
+        .to_bytes();
+    let login_payload: Value = serde_json::from_slice(&login_body).unwrap();
+
+    let refresh_res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/auth/refresh")
+                .method("POST")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({"refresh_token": login_payload["refresh_token"]}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(refresh_res.status(), StatusCode::OK);
+
+    let sessions_res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/auth/sessions")
+                .method("GET")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(sessions_res.status(), StatusCode::OK);
+
+    let family_id = login_payload["family_id"].as_str().unwrap();
+    let trust_res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!("/auth/sessions/{family_id}/trust"))
+                .method("PATCH")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(trust_res.status(), StatusCode::NO_CONTENT);
+
+    let delete_session_res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!("/auth/sessions/{family_id}"))
+                .method("DELETE")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(delete_session_res.status(), StatusCode::NO_CONTENT);
+
+    let logout_res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/auth/logout")
+                .method("POST")
+                .header("content-type", "application/json")
+                .body(Body::from(json!({"family_id": family_id}).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(logout_res.status(), StatusCode::NO_CONTENT);
+
+    let revoke_all_res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/auth/revoke-all")
+                .method("POST")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(revoke_all_res.status(), StatusCode::NO_CONTENT);
+
+    let create_legacy_invite_res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/auth/invites")
+                .method("POST")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({"user_id": Uuid::new_v4(), "tenant_id": tenant_id}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(create_legacy_invite_res.status(), StatusCode::OK);
+    let create_legacy_invite_body =
+        http_body_util::BodyExt::collect(create_legacy_invite_res.into_body())
+            .await
+            .unwrap()
+            .to_bytes();
+    let create_legacy_invite_payload: Value =
+        serde_json::from_slice(&create_legacy_invite_body).unwrap();
+
+    let accept_legacy_invite_res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/auth/invites/accept")
+                .method("POST")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({"invite_token": create_legacy_invite_payload["invite_token"]})
+                        .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(accept_legacy_invite_res.status(), StatusCode::NO_CONTENT);
+}
