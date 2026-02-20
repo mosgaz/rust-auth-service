@@ -66,6 +66,17 @@ struct InviteRecord {
     expires_at: chrono::DateTime<Utc>,
 }
 
+fn hash_password(password: &str) -> Result<String, StatusCode> {
+    if password.trim().is_empty() {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    Ok(format!("sha256${}", security::hash_token_sha256(password)))
+}
+
+fn verify_password(password_hash: &str, password: &str) -> bool {
+    password_hash == format!("sha256${}", security::hash_token_sha256(password))
+}
+
 #[derive(Clone, Serialize)]
 struct TenantMember {
     tenant_id: Uuid,
@@ -610,10 +621,17 @@ async fn create_invite(
     let invite_id = Uuid::new_v4();
     let token = format!("invite-{}", Uuid::new_v4());
     let expires_at = Utc::now() + Duration::hours(24);
+    let existing_user = state.users.read().await.get(payload.email.trim()).cloned();
+    let user_id = existing_user
+        .as_ref()
+        .map(|user| user.user_id)
+        .unwrap_or_else(Uuid::new_v4);
+    let is_new = existing_user.is_none();
+
     let record = InviteRecord {
         invite_id,
         tenant_id,
-        email: payload.email,
+        email: payload.email.trim().to_string(),
         token_hash: security::hash_token_sha256(&token),
         raw_token: token.clone(),
         used: false,

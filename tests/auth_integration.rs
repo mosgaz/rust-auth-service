@@ -73,12 +73,14 @@ async fn full_new_endpoints_flow() {
         .unwrap();
     assert_eq!(sessions_res.status(), StatusCode::OK);
 
-    let family_id = login_payload["family_id"].as_str().unwrap();
     let trust_res = app
         .clone()
         .oneshot(
             Request::builder()
-                .uri(format!("/auth/sessions/{family_id}/trust"))
+                .uri(format!(
+                    "/auth/sessions/{}/trust",
+                    login_payload["family_id"].as_str().unwrap()
+                ))
                 .method("PATCH")
                 .header("content-type", "application/json")
                 .body(Body::from(json!({"is_trusted": true}).to_string()))
