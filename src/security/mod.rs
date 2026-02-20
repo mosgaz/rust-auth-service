@@ -159,6 +159,18 @@ impl JwtManager {
     }
 
     pub fn verify_refresh(&self, token: &str) -> anyhow::Result<Claims> {
+        let data = self.decode_claims(token)?;
+        if data.typ != "refresh" {
+            anyhow::bail!("not a refresh token");
+        }
+        Ok(data)
+    }
+
+    pub fn verify_token(&self, token: &str) -> anyhow::Result<Claims> {
+        self.decode_claims(token)
+    }
+
+    fn decode_claims(&self, token: &str) -> anyhow::Result<Claims> {
         let header = decode_header(token)?;
         let kid = header.kid.ok_or_else(|| anyhow::anyhow!("missing kid"))?;
         let state = self.state.read().expect("jwt read lock");
@@ -169,9 +181,6 @@ impl JwtManager {
         let mut validation = Validation::new(Algorithm::RS256);
         validation.set_issuer(&[self.issuer.clone()]);
         let data = decode::<Claims>(token, &state.keys[idx].dec, &validation)?;
-        if data.claims.typ != "refresh" {
-            anyhow::bail!("not a refresh token");
-        }
         Ok(data.claims)
     }
 }
