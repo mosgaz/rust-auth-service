@@ -7,7 +7,7 @@
 - JWT (`RS256`) с подписью, валидацией refresh-токенов, ротацией ключа подписи и выдачей `JWKS`;
 - use-cases: `login`, `refresh`, `logout`, `invites`;
 - идемпотентность для `login` через `Idempotency-Key`;
-- заготовленные SQLx-миграции для PostgreSQL (`refresh_sessions`, `pending_invites`, `idempotency_keys`, `key_store`);
+- SQLx-миграции для PostgreSQL по спецификации БД (включая `users`, `identities`, `credentials`, `tenant_members`, `refresh_sessions`, `device_push_tokens`, `idempotency_keys`, `password_resets`, `pending_invites`, `key_store`);
 - интеграционный HTTP-тест полного auth-flow.
 
 ## Запуск
