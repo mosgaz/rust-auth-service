@@ -1,6 +1,15 @@
 # Техническое задание v.4.0
 ## Сервис аутентификации (Authentication Service)
 
+> Актуализация (по итогам `TZ_GAP_ANALYSIS`):
+> - Контракты `/auth/restore`, `/auth/reset-confirm`, `/api/tenants/{tenant_id}/invites`, `/api/invites/accept`, `/auth/logout`, `/auth/sessions`, `/auth/sessions/{family_id}/trust` синхронизированы с приоритетными требованиями GAP-анализа.
+> - Для `/auth/restore`, `/auth/reset-confirm`, `/api/tenants/{tenant_id}/invites` обязателен `Idempotency-Key`.
+> - `/auth/restore` всегда возвращает `202 Accepted` без выдачи reset-токена в ответе.
+> - `/auth/reset-confirm` возвращает `200 OK` и JSON `{ "success": true }`.
+> - `/auth/logout` принимает `refresh_token` (опционально) вместо `family_id`.
+> - `GET /auth/sessions` возвращает расширенную информацию по устройствам; `PATCH /auth/sessions/{family_id}/trust` реально обновляет флаг доверия.
+> - JWT claims используют `tid` и `fam`.
+
 ## Оглавление
 1. [Термины и определения](#1-термины-и-определения)
 2. [Архитектура сервиса](#2-архитектура-сервиса)
