@@ -47,8 +47,8 @@ pub struct JwtTokens {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Claims {
     pub sub: String,
-    pub tenant_id: String,
-    pub family_id: String,
+    pub tid: String,
+    pub fam: String,
     pub jti: String,
     pub typ: String,
     pub iss: String,
@@ -130,8 +130,8 @@ impl JwtManager {
         header.kid = Some(key.kid.clone());
         let access_claims = Claims {
             sub: user_id.to_string(),
-            tenant_id: tenant_id.to_string(),
-            family_id: family_id.to_string(),
+            tid: tenant_id.to_string(),
+            fam: family_id.to_string(),
             jti: access_jti,
             typ: "access".into(),
             iss: self.issuer.clone(),
@@ -140,8 +140,8 @@ impl JwtManager {
         };
         let refresh_claims = Claims {
             sub: user_id.to_string(),
-            tenant_id: tenant_id.to_string(),
-            family_id: family_id.to_string(),
+            tid: tenant_id.to_string(),
+            fam: family_id.to_string(),
             jti: refresh_jti.clone(),
             typ: "refresh".into(),
             iss: self.issuer.clone(),

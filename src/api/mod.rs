@@ -37,6 +37,11 @@ struct SessionRecord {
     user_id: Uuid,
     tenant_id: Uuid,
     current_jti_hash: String,
+    device_name: Option<String>,
+    device_type: Option<String>,
+    device_info: Option<serde_json::Value>,
+    last_active_at: chrono::DateTime<Utc>,
+    is_trusted: bool,
     deleted: bool,
 }
 
@@ -44,7 +49,7 @@ struct SessionRecord {
 struct UserRecord {
     user_id: Uuid,
     email: String,
-    password: String,
+    password_hash: String,
 }
 
 #[derive(Clone, Serialize)]
@@ -55,6 +60,17 @@ struct InviteRecord {
     token_hash: String,
     used: bool,
     expires_at: chrono::DateTime<Utc>,
+}
+
+fn hash_password(password: &str) -> Result<String, StatusCode> {
+    if password.trim().is_empty() {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    Ok(format!("sha256${}", security::hash_token_sha256(password)))
+}
+
+fn verify_password(password_hash: &str, password: &str) -> bool {
+    password_hash == format!("sha256${}", security::hash_token_sha256(password))
 }
 
 #[derive(Clone, Serialize)]
@@ -177,7 +193,7 @@ async fn register(
     let user = UserRecord {
         user_id: Uuid::new_v4(),
         email: payload.email.trim().to_owned(),
-        password: payload.password,
+        password_hash: hash_password(payload.password.trim())?,
     };
     let response = RegisterResponse {
         user_id: user.user_id,
@@ -191,6 +207,9 @@ struct LoginRequest {
     identity: String,
     password: String,
     tenant_id: Option<Uuid>,
+    device_name: Option<String>,
+    device_type: Option<String>,
+    device_info: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Serialize)]
@@ -220,7 +239,7 @@ async fn login(
     }
 
     if let Some(user) = state.users.read().await.get(payload.identity.trim()) {
-        if user.password != payload.password {
+        if !verify_password(&user.password_hash, payload.password.trim()) {
             return Err(StatusCode::UNAUTHORIZED);
         }
     }
@@ -243,6 +262,11 @@ async fn login(
         user_id,
         tenant_id,
         current_jti_hash: security::hash_token_sha256(&tokens.refresh_jti),
+        device_name: payload.device_name,
+        device_type: payload.device_type,
+        device_info: payload.device_info,
+        last_active_at: Utc::now(),
+        is_trusted: false,
         deleted: false,
     };
     state.sessions.write().await.insert(family_id, record);
@@ -288,7 +312,7 @@ async fn refresh(
         .jwt
         .verify_refresh(payload.refresh_token.trim())
         .map_err(|_| StatusCode::UNAUTHORIZED)?;
-    let family_id = Uuid::parse_str(&claims.family_id).map_err(|_| StatusCode::UNAUTHORIZED)?;
+    let family_id = Uuid::parse_str(&claims.fam).map_err(|_| StatusCode::UNAUTHORIZED)?;
 
     let mut sessions = state.sessions.write().await;
     let record = sessions
@@ -303,6 +327,7 @@ async fn refresh(
         .issue_tokens(record.user_id, record.tenant_id, family_id)
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     record.current_jti_hash = security::hash_token_sha256(&tokens.refresh_jti);
+    record.last_active_at = Utc::now();
 
     Ok(Json(RefreshResponse {
         access_token: tokens.access_token,
@@ -313,12 +338,18 @@ async fn refresh(
 
 #[derive(Debug, Deserialize)]
 struct LogoutRequest {
-    family_id: Uuid,
+    refresh_token: Option<String>,
 }
 
 async fn logout(State(state): State<AppState>, Json(payload): Json<LogoutRequest>) -> StatusCode {
-    if let Some(session) = state.sessions.write().await.get_mut(&payload.family_id) {
-        session.deleted = true;
+    if let Some(refresh_token) = payload.refresh_token {
+        if let Ok(claims) = state.jwt.verify_refresh(refresh_token.trim()) {
+            if let Ok(family_id) = Uuid::parse_str(&claims.fam) {
+                if let Some(session) = state.sessions.write().await.get_mut(&family_id) {
+                    session.deleted = true;
+                }
+            }
+        }
     }
     StatusCode::NO_CONTENT
 }
@@ -334,15 +365,19 @@ async fn logout_all(State(state): State<AppState>) -> StatusCode {
 struct RestoreRequest {
     email: String,
 }
-#[derive(Debug, Serialize)]
-struct RestoreResponse {
-    reset_token: String,
-}
 
 async fn restore_password(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Json(payload): Json<RestoreRequest>,
-) -> Result<Json<RestoreResponse>, StatusCode> {
+) -> Result<StatusCode, StatusCode> {
+    if headers
+        .get("idempotency-key")
+        .and_then(|v| v.to_str().ok())
+        .is_none()
+    {
+        return Err(StatusCode::BAD_REQUEST);
+    }
     if payload.email.trim().is_empty() {
         return Err(StatusCode::BAD_REQUEST);
     }
@@ -352,7 +387,7 @@ async fn restore_password(
         .write()
         .await
         .insert(security::hash_token_sha256(&token), payload.email);
-    Ok(Json(RestoreResponse { reset_token: token }))
+    Ok(StatusCode::ACCEPTED)
 }
 
 #[derive(Debug, Deserialize)]
@@ -363,8 +398,16 @@ struct ResetConfirmRequest {
 
 async fn reset_confirm(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Json(payload): Json<ResetConfirmRequest>,
-) -> Result<StatusCode, StatusCode> {
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    if headers
+        .get("idempotency-key")
+        .and_then(|v| v.to_str().ok())
+        .is_none()
+    {
+        return Err(StatusCode::BAD_REQUEST);
+    }
     if payload.new_password.trim().is_empty() {
         return Err(StatusCode::BAD_REQUEST);
     }
@@ -372,14 +415,24 @@ async fn reset_confirm(
     let token_hash = security::hash_token_sha256(payload.reset_token.trim());
     let email = resets.remove(&token_hash).ok_or(StatusCode::NOT_FOUND)?;
     if let Some(user) = state.users.write().await.get_mut(&email) {
-        user.password = payload.new_password;
+        user.password_hash = hash_password(payload.new_password.trim())?;
     }
-    Ok(StatusCode::NO_CONTENT)
+    Ok(Json(serde_json::json!({"success": true})))
 }
 
 #[derive(Debug, Serialize)]
 struct SessionListResponse {
-    sessions: Vec<Uuid>,
+    sessions: Vec<SessionInfo>,
+}
+
+#[derive(Debug, Serialize)]
+struct SessionInfo {
+    family_id: Uuid,
+    device_name: Option<String>,
+    device_type: Option<String>,
+    device_info: Option<serde_json::Value>,
+    last_active_at: String,
+    is_trusted: bool,
 }
 
 async fn list_sessions(State(state): State<AppState>) -> Json<SessionListResponse> {
@@ -388,7 +441,16 @@ async fn list_sessions(State(state): State<AppState>) -> Json<SessionListRespons
         .read()
         .await
         .iter()
-        .filter_map(|(id, session)| (!session.deleted).then_some(*id))
+        .filter_map(|(id, session)| {
+            (!session.deleted).then_some(SessionInfo {
+                family_id: *id,
+                device_name: session.device_name.clone(),
+                device_type: session.device_type.clone(),
+                device_info: session.device_info.clone(),
+                last_active_at: session.last_active_at.to_rfc3339(),
+                is_trusted: session.is_trusted,
+            })
+        })
         .collect();
     Json(SessionListResponse { sessions })
 }
@@ -400,8 +462,20 @@ async fn delete_session(Path(family_id): Path<Uuid>, State(state): State<AppStat
     StatusCode::NO_CONTENT
 }
 
-async fn trust_session() -> StatusCode {
-    StatusCode::NO_CONTENT
+#[derive(Debug, Deserialize)]
+struct TrustSessionRequest {
+    is_trusted: bool,
+}
+
+async fn trust_session(
+    Path(family_id): Path<Uuid>,
+    State(state): State<AppState>,
+    Json(payload): Json<TrustSessionRequest>,
+) -> Result<StatusCode, StatusCode> {
+    let mut sessions = state.sessions.write().await;
+    let session = sessions.get_mut(&family_id).ok_or(StatusCode::NOT_FOUND)?;
+    session.is_trusted = payload.is_trusted;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 #[derive(Debug, Deserialize)]
@@ -451,26 +525,41 @@ struct CreateInviteRequest {
 }
 #[derive(Debug, Serialize)]
 struct CreateInviteResponse {
+    user_id: Uuid,
+    is_new: bool,
     invite_id: Uuid,
-    invite_token: String,
-    expires_at: String,
 }
 
 async fn create_invite(
     Path(tenant_id): Path<Uuid>,
     State(state): State<AppState>,
+    headers: HeaderMap,
     Json(payload): Json<CreateInviteRequest>,
 ) -> Result<(StatusCode, Json<CreateInviteResponse>), StatusCode> {
+    if headers
+        .get("idempotency-key")
+        .and_then(|v| v.to_str().ok())
+        .is_none()
+    {
+        return Err(StatusCode::BAD_REQUEST);
+    }
     if payload.email.trim().is_empty() {
         return Err(StatusCode::BAD_REQUEST);
     }
     let invite_id = Uuid::new_v4();
     let token = format!("invite-{}", Uuid::new_v4());
     let expires_at = Utc::now() + Duration::hours(24);
+    let existing_user = state.users.read().await.get(payload.email.trim()).cloned();
+    let user_id = existing_user
+        .as_ref()
+        .map(|user| user.user_id)
+        .unwrap_or_else(Uuid::new_v4);
+    let is_new = existing_user.is_none();
+
     let record = InviteRecord {
         invite_id,
         tenant_id,
-        email: payload.email,
+        email: payload.email.trim().to_string(),
         token_hash: security::hash_token_sha256(&token),
         used: false,
         expires_at,
@@ -479,9 +568,9 @@ async fn create_invite(
     Ok((
         StatusCode::CREATED,
         Json(CreateInviteResponse {
+            user_id,
+            is_new,
             invite_id,
-            invite_token: token,
-            expires_at: expires_at.to_rfc3339(),
         }),
     ))
 }
@@ -517,14 +606,21 @@ async fn delete_invite(
 
 #[derive(Debug, Deserialize)]
 struct AcceptInviteRequest {
-    invite_token: String,
+    token: String,
+}
+
+#[derive(Debug, Serialize)]
+struct AcceptInviteResponse {
+    tenant_id: Uuid,
+    user_id: Uuid,
+    membership_status: String,
 }
 
 async fn accept_invite(
     State(state): State<AppState>,
     Json(payload): Json<AcceptInviteRequest>,
-) -> Result<StatusCode, StatusCode> {
-    let token_hash = security::hash_token_sha256(payload.invite_token.trim());
+) -> Result<Json<AcceptInviteResponse>, StatusCode> {
+    let token_hash = security::hash_token_sha256(payload.token.trim());
     let mut invites = state.invites.write().await;
     let invite = invites
         .values_mut()
@@ -550,7 +646,11 @@ async fn accept_invite(
             status: "active".into(),
         },
     );
-    Ok(StatusCode::NO_CONTENT)
+    Ok(Json(AcceptInviteResponse {
+        tenant_id: invite.tenant_id,
+        user_id,
+        membership_status: "active".into(),
+    }))
 }
 
 #[derive(Debug, Deserialize)]
@@ -579,16 +679,16 @@ async fn create_invite_legacy(
         },
     );
     Json(CreateInviteResponse {
+        user_id: payload.user_id,
+        is_new: false,
         invite_id,
-        invite_token: token,
-        expires_at: expires_at.to_rfc3339(),
     })
 }
 
 async fn accept_invite_legacy(
     State(state): State<AppState>,
     Json(payload): Json<AcceptInviteRequest>,
-) -> Result<StatusCode, StatusCode> {
+) -> Result<Json<AcceptInviteResponse>, StatusCode> {
     accept_invite(State(state), Json(payload)).await
 }
 
