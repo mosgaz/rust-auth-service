@@ -19,6 +19,29 @@ pub fn hash_token_sha256(token: &str) -> String {
     URL_SAFE_NO_PAD.encode(hasher.finalize())
 }
 
+pub fn hash_password(password: &str) -> anyhow::Result<String> {
+    let salt = Uuid::new_v4().to_string();
+    let hash = hash_token_sha256(&format!("{}:{}", salt, password));
+    Ok(format!("sha256${salt}${hash}"))
+}
+
+pub fn verify_password(password: &str, password_hash: &str) -> bool {
+    let Some(rest) = password_hash.strip_prefix("sha256$") else {
+        return false;
+    };
+    let mut parts = rest.split('$');
+    let Some(salt) = parts.next() else {
+        return false;
+    };
+    let Some(expected_hash) = parts.next() else {
+        return false;
+    };
+    if parts.next().is_some() {
+        return false;
+    }
+    hash_token_sha256(&format!("{}:{}", salt, password)) == expected_hash
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct Jwk {
     pub kid: String,
@@ -47,7 +70,9 @@ pub struct JwtTokens {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Claims {
     pub sub: String,
+    #[serde(alias = "tenant_id")]
     pub tid: String,
+    #[serde(alias = "family_id")]
     pub fam: String,
     pub jti: String,
     pub typ: String,

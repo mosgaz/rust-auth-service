@@ -1,14 +1,21 @@
 # Техническое задание v.4.0
 ## Сервис аутентификации (Authentication Service)
 
-> Актуализация (по итогам `TZ_GAP_ANALYSIS`):
-> - Контракты `/auth/restore`, `/auth/reset-confirm`, `/api/tenants/{tenant_id}/invites`, `/api/invites/accept`, `/auth/logout`, `/auth/sessions`, `/auth/sessions/{family_id}/trust` синхронизированы с приоритетными требованиями GAP-анализа.
-> - Для `/auth/restore`, `/auth/reset-confirm`, `/api/tenants/{tenant_id}/invites` обязателен `Idempotency-Key`.
-> - `/auth/restore` всегда возвращает `202 Accepted` без выдачи reset-токена в ответе.
-> - `/auth/reset-confirm` возвращает `200 OK` и JSON `{ "success": true }`.
-> - `/auth/logout` принимает `refresh_token` (опционально) вместо `family_id`.
-> - `GET /auth/sessions` возвращает расширенную информацию по устройствам; `PATCH /auth/sessions/{family_id}/trust` реально обновляет флаг доверия.
-> - JWT claims используют `tid` и `fam`.
+## Статус актуализации (2026-02-20)
+
+Ниже зафиксированы доработки, выполненные по `docs/TZ_GAP_ANALYSIS.md` (имеет приоритет):
+
+- Пароли в runtime больше не хранятся в открытом виде: используется salted SHA-256 формат `sha256$<salt>$<hash>`; миграция на Argon2id остаётся следующим шагом при доступности зависимости.
+- `POST /auth/restore`, `POST /auth/reset-confirm`, `POST /api/tenants/{tenant_id}/invites` требуют `Idempotency-Key`.
+- `POST /auth/restore` возвращает `202 Accepted` (без выдачи reset-токена в API-ответе).
+- `POST /auth/reset-confirm` возвращает `200 OK` с телом `{ "success": true }`.
+- `POST /auth/logout` принимает `refresh_token` (и поддерживает `family_id` для обратной совместимости).
+- `GET /auth/sessions` возвращает расширенный список сессий (device/trust/activity).
+- `PATCH /auth/sessions/{family_id}/trust` изменяет trust-флаг сессии.
+- `POST /api/invites/accept` принимает поле `token` и возвращает `200` с JSON-данными о принятии.
+- В refresh-потоке добавлен reuse detection на основе истории JTI в семье токенов с инвалидацией сессии и записью security-события.
+- В миграциях добавлены отсутствующие сущности: `tenants`, а также lifecycle-поля `expires_at`/`revoked_at` в `key_store`.
+
 
 ## Оглавление
 1. [Термины и определения](#1-термины-и-определения)

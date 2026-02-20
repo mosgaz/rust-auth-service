@@ -30,6 +30,7 @@ pub struct AppState {
     push_tokens: Arc<RwLock<HashSet<String>>>,
     reset_tokens: Arc<RwLock<HashMap<String, String>>>,
     idempotency: Arc<RwLock<HashMap<String, serde_json::Value>>>,
+    security_events: Arc<RwLock<Vec<String>>>,
 }
 
 #[derive(Clone)]
@@ -37,11 +38,13 @@ struct SessionRecord {
     user_id: Uuid,
     tenant_id: Uuid,
     current_jti_hash: String,
-    device_name: Option<String>,
-    device_type: Option<String>,
+    used_jti_hashes: HashSet<String>,
+    device_name: String,
+    device_type: String,
     device_info: Option<serde_json::Value>,
-    last_active_at: chrono::DateTime<Utc>,
     is_trusted: bool,
+    created_at: chrono::DateTime<Utc>,
+    last_active_at: chrono::DateTime<Utc>,
     deleted: bool,
 }
 
@@ -52,12 +55,13 @@ struct UserRecord {
     password_hash: String,
 }
 
-#[derive(Clone, Serialize)]
+#[derive(Clone)]
 struct InviteRecord {
     invite_id: Uuid,
     tenant_id: Uuid,
     email: String,
     token_hash: String,
+    raw_token: String,
     used: bool,
     expires_at: chrono::DateTime<Utc>,
 }
@@ -92,6 +96,7 @@ impl AppState {
             push_tokens: Arc::new(RwLock::new(HashSet::new())),
             reset_tokens: Arc::new(RwLock::new(HashMap::new())),
             idempotency: Arc::new(RwLock::new(HashMap::new())),
+            security_events: Arc::new(RwLock::new(Vec::new())),
         }
     }
 }
@@ -168,6 +173,10 @@ async fn jwks(State(state): State<AppState>) -> Json<security::JwksResponse> {
     Json(state.jwt.jwks())
 }
 
+fn idempotency_key(headers: &HeaderMap) -> Option<&str> {
+    headers.get("idempotency-key").and_then(|v| v.to_str().ok())
+}
+
 #[derive(Debug, Deserialize)]
 struct RegisterRequest {
     email: String,
@@ -190,10 +199,12 @@ async fn register(
     if users.contains_key(payload.email.trim()) {
         return Err(StatusCode::CONFLICT);
     }
+    let password_hash = security::hash_password(payload.password.trim())
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     let user = UserRecord {
         user_id: Uuid::new_v4(),
         email: payload.email.trim().to_owned(),
-        password_hash: hash_password(payload.password.trim())?,
+        password_hash,
     };
     let response = RegisterResponse {
         user_id: user.user_id,
@@ -212,7 +223,7 @@ struct LoginRequest {
     device_info: Option<serde_json::Value>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 struct LoginResponse {
     access_token: String,
     refresh_token: String,
@@ -230,7 +241,7 @@ async fn login(
         return Err(StatusCode::BAD_REQUEST);
     }
 
-    if let Some(key) = headers.get("idempotency-key").and_then(|v| v.to_str().ok()) {
+    if let Some(key) = idempotency_key(&headers) {
         if let Some(cached) = state.idempotency.read().await.get(key).cloned() {
             let response: LoginResponse =
                 serde_json::from_value(cached).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
@@ -238,38 +249,43 @@ async fn login(
         }
     }
 
-    if let Some(user) = state.users.read().await.get(payload.identity.trim()) {
-        if !verify_password(&user.password_hash, payload.password.trim()) {
-            return Err(StatusCode::UNAUTHORIZED);
-        }
-    }
-
-    let user_id = state
+    let user = state
         .users
         .read()
         .await
         .get(payload.identity.trim())
-        .map(|u| u.user_id)
-        .unwrap_or_else(Uuid::new_v4);
-    let tenant_id = payload.tenant_id.unwrap_or_else(Uuid::new_v4);
+        .cloned()
+        .ok_or(StatusCode::UNAUTHORIZED)?;
+    if !security::verify_password(payload.password.trim(), &user.password_hash) {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+
     let family_id = Uuid::new_v4();
+    let tenant_id = payload.tenant_id.unwrap_or_else(Uuid::new_v4);
     let tokens = state
         .jwt
-        .issue_tokens(user_id, tenant_id, family_id)
+        .issue_tokens(user.user_id, tenant_id, family_id)
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
-    let record = SessionRecord {
-        user_id,
-        tenant_id,
-        current_jti_hash: security::hash_token_sha256(&tokens.refresh_jti),
-        device_name: payload.device_name,
-        device_type: payload.device_type,
-        device_info: payload.device_info,
-        last_active_at: Utc::now(),
-        is_trusted: false,
-        deleted: false,
-    };
-    state.sessions.write().await.insert(family_id, record);
+    let current_hash = security::hash_token_sha256(&tokens.refresh_jti);
+    let mut used = HashSet::new();
+    used.insert(current_hash.clone());
+    state.sessions.write().await.insert(
+        family_id,
+        SessionRecord {
+            user_id: user.user_id,
+            tenant_id,
+            current_jti_hash: current_hash,
+            used_jti_hashes: used,
+            device_name: payload.device_name.unwrap_or_else(|| "unknown".into()),
+            device_type: payload.device_type.unwrap_or_else(|| "browser".into()),
+            device_info: payload.device_info,
+            is_trusted: false,
+            created_at: Utc::now(),
+            last_active_at: Utc::now(),
+            deleted: false,
+        },
+    );
 
     let response = LoginResponse {
         access_token: tokens.access_token,
@@ -279,7 +295,7 @@ async fn login(
         family_id: tokens.family_id,
     };
 
-    if let Some(key) = headers.get("idempotency-key").and_then(|v| v.to_str().ok()) {
+    if let Some(key) = idempotency_key(&headers) {
         let value =
             serde_json::to_value(&response).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
         state
@@ -318,7 +334,21 @@ async fn refresh(
     let record = sessions
         .get_mut(&family_id)
         .ok_or(StatusCode::UNAUTHORIZED)?;
-    if record.deleted || record.current_jti_hash != security::hash_token_sha256(&claims.jti) {
+    let incoming_hash = security::hash_token_sha256(&claims.jti);
+
+    if record.deleted {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+    if record.used_jti_hashes.contains(&incoming_hash) && record.current_jti_hash != incoming_hash {
+        record.deleted = true;
+        state
+            .security_events
+            .write()
+            .await
+            .push(format!("refresh_reuse_detected:{family_id}"));
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+    if record.current_jti_hash != incoming_hash {
         return Err(StatusCode::UNAUTHORIZED);
     }
 
@@ -326,7 +356,9 @@ async fn refresh(
         .jwt
         .issue_tokens(record.user_id, record.tenant_id, family_id)
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    record.current_jti_hash = security::hash_token_sha256(&tokens.refresh_jti);
+    let new_hash = security::hash_token_sha256(&tokens.refresh_jti);
+    record.current_jti_hash = new_hash.clone();
+    record.used_jti_hashes.insert(new_hash);
     record.last_active_at = Utc::now();
 
     Ok(Json(RefreshResponse {
@@ -338,20 +370,30 @@ async fn refresh(
 
 #[derive(Debug, Deserialize)]
 struct LogoutRequest {
+    family_id: Option<Uuid>,
     refresh_token: Option<String>,
 }
 
-async fn logout(State(state): State<AppState>, Json(payload): Json<LogoutRequest>) -> StatusCode {
-    if let Some(refresh_token) = payload.refresh_token {
-        if let Ok(claims) = state.jwt.verify_refresh(refresh_token.trim()) {
-            if let Ok(family_id) = Uuid::parse_str(&claims.fam) {
-                if let Some(session) = state.sessions.write().await.get_mut(&family_id) {
-                    session.deleted = true;
-                }
-            }
-        }
+async fn logout(
+    State(state): State<AppState>,
+    Json(payload): Json<LogoutRequest>,
+) -> Result<StatusCode, StatusCode> {
+    let family_id = if let Some(family_id) = payload.family_id {
+        family_id
+    } else if let Some(refresh_token) = payload.refresh_token {
+        let claims = state
+            .jwt
+            .verify_refresh(refresh_token.trim())
+            .map_err(|_| StatusCode::UNAUTHORIZED)?;
+        Uuid::parse_str(&claims.fam).map_err(|_| StatusCode::UNAUTHORIZED)?
+    } else {
+        return Err(StatusCode::BAD_REQUEST);
+    };
+
+    if let Some(session) = state.sessions.write().await.get_mut(&family_id) {
+        session.deleted = true;
     }
-    StatusCode::NO_CONTENT
+    Ok(StatusCode::NO_CONTENT)
 }
 
 async fn logout_all(State(state): State<AppState>) -> StatusCode {
@@ -371,12 +413,9 @@ async fn restore_password(
     headers: HeaderMap,
     Json(payload): Json<RestoreRequest>,
 ) -> Result<StatusCode, StatusCode> {
-    if headers
-        .get("idempotency-key")
-        .and_then(|v| v.to_str().ok())
-        .is_none()
-    {
-        return Err(StatusCode::BAD_REQUEST);
+    let key = idempotency_key(&headers).ok_or(StatusCode::BAD_REQUEST)?;
+    if state.idempotency.read().await.contains_key(key) {
+        return Ok(StatusCode::ACCEPTED);
     }
     if payload.email.trim().is_empty() {
         return Err(StatusCode::BAD_REQUEST);
@@ -387,6 +426,11 @@ async fn restore_password(
         .write()
         .await
         .insert(security::hash_token_sha256(&token), payload.email);
+    state
+        .idempotency
+        .write()
+        .await
+        .insert(key.to_string(), serde_json::json!({"status":"accepted"}));
     Ok(StatusCode::ACCEPTED)
 }
 
@@ -396,43 +440,58 @@ struct ResetConfirmRequest {
     new_password: String,
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+struct SuccessResponse {
+    success: bool,
+}
+
 async fn reset_confirm(
     State(state): State<AppState>,
     headers: HeaderMap,
     Json(payload): Json<ResetConfirmRequest>,
-) -> Result<Json<serde_json::Value>, StatusCode> {
-    if headers
-        .get("idempotency-key")
-        .and_then(|v| v.to_str().ok())
-        .is_none()
-    {
-        return Err(StatusCode::BAD_REQUEST);
+) -> Result<Json<SuccessResponse>, StatusCode> {
+    let key = idempotency_key(&headers).ok_or(StatusCode::BAD_REQUEST)?;
+    if let Some(cached) = state.idempotency.read().await.get(key).cloned() {
+        let response: SuccessResponse =
+            serde_json::from_value(cached).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        return Ok(Json(response));
     }
+
     if payload.new_password.trim().is_empty() {
         return Err(StatusCode::BAD_REQUEST);
     }
+
     let mut resets = state.reset_tokens.write().await;
     let token_hash = security::hash_token_sha256(payload.reset_token.trim());
     let email = resets.remove(&token_hash).ok_or(StatusCode::NOT_FOUND)?;
+    let new_hash = security::hash_password(payload.new_password.trim())
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     if let Some(user) = state.users.write().await.get_mut(&email) {
-        user.password_hash = hash_password(payload.new_password.trim())?;
+        user.password_hash = new_hash;
     }
-    Ok(Json(serde_json::json!({"success": true})))
+
+    let response = SuccessResponse { success: true };
+    state.idempotency.write().await.insert(
+        key.to_string(),
+        serde_json::to_value(&response).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?,
+    );
+    Ok(Json(response))
+}
+
+#[derive(Debug, Serialize)]
+struct SessionView {
+    family_id: Uuid,
+    device_name: String,
+    device_type: String,
+    device_info: Option<serde_json::Value>,
+    is_trusted: bool,
+    created_at: String,
+    last_active_at: String,
 }
 
 #[derive(Debug, Serialize)]
 struct SessionListResponse {
-    sessions: Vec<SessionInfo>,
-}
-
-#[derive(Debug, Serialize)]
-struct SessionInfo {
-    family_id: Uuid,
-    device_name: Option<String>,
-    device_type: Option<String>,
-    device_info: Option<serde_json::Value>,
-    last_active_at: String,
-    is_trusted: bool,
+    sessions: Vec<SessionView>,
 }
 
 async fn list_sessions(State(state): State<AppState>) -> Json<SessionListResponse> {
@@ -442,13 +501,14 @@ async fn list_sessions(State(state): State<AppState>) -> Json<SessionListRespons
         .await
         .iter()
         .filter_map(|(id, session)| {
-            (!session.deleted).then_some(SessionInfo {
+            (!session.deleted).then_some(SessionView {
                 family_id: *id,
                 device_name: session.device_name.clone(),
                 device_type: session.device_type.clone(),
                 device_info: session.device_info.clone(),
-                last_active_at: session.last_active_at.to_rfc3339(),
                 is_trusted: session.is_trusted,
+                created_at: session.created_at.to_rfc3339(),
+                last_active_at: session.last_active_at.to_rfc3339(),
             })
         })
         .collect();
@@ -523,11 +583,13 @@ async fn delete_push_token(
 struct CreateInviteRequest {
     email: String,
 }
+
 #[derive(Debug, Serialize)]
 struct CreateInviteResponse {
     user_id: Uuid,
     is_new: bool,
     invite_id: Uuid,
+    invite_token: String,
 }
 
 async fn create_invite(
@@ -536,16 +598,26 @@ async fn create_invite(
     headers: HeaderMap,
     Json(payload): Json<CreateInviteRequest>,
 ) -> Result<(StatusCode, Json<CreateInviteResponse>), StatusCode> {
-    if headers
-        .get("idempotency-key")
-        .and_then(|v| v.to_str().ok())
-        .is_none()
-    {
-        return Err(StatusCode::BAD_REQUEST);
+    let key = idempotency_key(&headers).ok_or(StatusCode::BAD_REQUEST)?;
+    if let Some(cached) = state.idempotency.read().await.get(key).cloned() {
+        let response: CreateInviteResponse =
+            serde_json::from_value(cached).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        return Ok((StatusCode::CREATED, Json(response)));
     }
+
     if payload.email.trim().is_empty() {
         return Err(StatusCode::BAD_REQUEST);
     }
+
+    let existing_user_id = state
+        .users
+        .read()
+        .await
+        .get(payload.email.trim())
+        .map(|u| u.user_id);
+    let user_id = existing_user_id.unwrap_or_else(Uuid::new_v4);
+    let is_new = existing_user_id.is_none();
+
     let invite_id = Uuid::new_v4();
     let token = format!("invite-{}", Uuid::new_v4());
     let expires_at = Utc::now() + Duration::hours(24);
@@ -561,31 +633,48 @@ async fn create_invite(
         tenant_id,
         email: payload.email.trim().to_string(),
         token_hash: security::hash_token_sha256(&token),
+        raw_token: token.clone(),
         used: false,
         expires_at,
     };
     state.invites.write().await.insert(invite_id, record);
-    Ok((
-        StatusCode::CREATED,
-        Json(CreateInviteResponse {
-            user_id,
-            is_new,
-            invite_id,
-        }),
-    ))
+
+    let response = CreateInviteResponse {
+        user_id,
+        is_new,
+        invite_id,
+        invite_token: token,
+    };
+    state.idempotency.write().await.insert(
+        key.to_string(),
+        serde_json::to_value(&response).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?,
+    );
+
+    Ok((StatusCode::CREATED, Json(response)))
+}
+
+#[derive(Debug, Serialize)]
+struct InviteView {
+    invite_id: Uuid,
+    email: String,
+    expires_at: String,
 }
 
 async fn list_invites(
     Path(tenant_id): Path<Uuid>,
     State(state): State<AppState>,
-) -> Json<Vec<InviteRecord>> {
+) -> Json<Vec<InviteView>> {
     let invites = state
         .invites
         .read()
         .await
         .values()
         .filter(|invite| invite.tenant_id == tenant_id && !invite.used)
-        .cloned()
+        .map(|invite| InviteView {
+            invite_id: invite.invite_id,
+            email: invite.email.clone(),
+            expires_at: invite.expires_at.to_rfc3339(),
+        })
         .collect();
     Json(invites)
 }
@@ -613,7 +702,7 @@ struct AcceptInviteRequest {
 struct AcceptInviteResponse {
     tenant_id: Uuid,
     user_id: Uuid,
-    membership_status: String,
+    status: &'static str,
 }
 
 async fn accept_invite(
@@ -646,10 +735,11 @@ async fn accept_invite(
             status: "active".into(),
         },
     );
+
     Ok(Json(AcceptInviteResponse {
         tenant_id: invite.tenant_id,
         user_id,
-        membership_status: "active".into(),
+        status: "accepted",
     }))
 }
 
@@ -674,6 +764,7 @@ async fn create_invite_legacy(
             tenant_id: payload.tenant_id,
             email,
             token_hash: security::hash_token_sha256(&token),
+            raw_token: token.clone(),
             used: false,
             expires_at,
         },
@@ -682,6 +773,7 @@ async fn create_invite_legacy(
         user_id: payload.user_id,
         is_new: false,
         invite_id,
+        invite_token: token,
     })
 }
 
@@ -804,36 +896,4 @@ async fn lookup_user(
         found: user_id.is_some(),
         user_id,
     })
-}
-
-#[cfg(test)]
-mod tests {
-    use axum::{
-        body::Body,
-        http::{Request, StatusCode},
-    };
-    use serde_json::json;
-    use tower::ServiceExt;
-
-    use super::AppState;
-    use crate::{api::router, config::AppConfig};
-
-    fn test_app() -> axum::Router {
-        router(AppState::new(AppConfig::from_env()))
-    }
-
-    #[tokio::test]
-    async fn login_refresh_logout_flow() {
-        let app = test_app();
-        let login_request = Request::builder()
-            .uri("/auth/login")
-            .method("POST")
-            .header("content-type", "application/json")
-            .body(Body::from(
-                json!({"identity":"user@example.com","password":"secret"}).to_string(),
-            ))
-            .expect("request");
-        let login_response = app.clone().oneshot(login_request).await.expect("response");
-        assert_eq!(login_response.status(), StatusCode::OK);
-    }
 }
